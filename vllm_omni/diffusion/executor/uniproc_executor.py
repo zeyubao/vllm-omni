@@ -21,7 +21,11 @@ The multiproc executor enforces deadlines via its result-queue dequeue.
 from __future__ import annotations
 
 import gc
+import threading
+import uuid
+from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -31,16 +35,18 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.executor.async_output_cache import AsyncOutputFutureMixin
+from vllm_omni.diffusion.request_streaming import request_chunk_transport
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
 
-class UniProcDiffusionExecutor(DiffusionExecutor):
+class UniProcDiffusionExecutor(AsyncOutputFutureMixin, DiffusionExecutor):
     """Runs a single diffusion worker inline, with no IPC of any kind."""
 
     def _init_executor(self) -> None:
@@ -51,6 +57,11 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         self.driver_worker = None
         self._failure_callbacks: list[Callable[[], None]] = []
         self._warned_about_timeout = False
+        self._chunk_ready_handler = None
+        self._futures_lock = threading.RLock()
+        self._output_futures = {}
+        self._completed_outputs = {}
+        self._dropped_output_ids = OrderedDict()
 
         num_gpus = self.od_config.num_gpus or 1
         if num_gpus != 1:
@@ -109,16 +120,59 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                 "the worker runs on the calling thread, so a hung call blocks it."
             )
         try:
-            result = self.driver_worker.execute_method(method, *(args or ()), **(kwargs or {}))
+            streaming = (
+                method in {"execute_model", "execute_model_batch"}
+                and getattr(self.od_config, "streaming_output", False)
+                and not getattr(self.od_config, "step_execution", False)
+            )
+            scope = request_chunk_transport(self._make_inline_emitter) if streaming else nullcontext()
+            with scope:
+                result = self.driver_worker.execute_method(method, *(args or ()), **(kwargs or {}))
+            if isinstance(result, DiffusionOutput):
+                result._record_device_ready()
+            elif isinstance(result, RunnerOutput):
+                if result.result is not None:
+                    result.result._record_device_ready()
+            elif isinstance(result, BatchRunnerOutput):
+                for output in result.runner_outputs:
+                    if output.result is not None:
+                        output.result._record_device_ready()
         except Exception:
             if not self._device_is_usable():
                 self._mark_failed()
             raise
         return result if unique_reply_rank is not None else [result]
 
+    def register_chunk_ready_handler(
+        self,
+        handler: Callable[[str, int, DiffusionOutput | None, str | None], None] | None,
+    ) -> None:
+        """Deliver in-process request chunks through the engine's existing stream contract."""
+        self._chunk_ready_handler = handler
+
+    def _make_inline_emitter(self, request_id: str) -> Callable[[DiffusionOutput], None]:
+        def emit(output: DiffusionOutput) -> None:
+            if not isinstance(output, DiffusionOutput) or output.finished:
+                raise ValueError("Request chunk emit requires an unfinished DiffusionOutput")
+            self._ensure_open()
+            handler = self._chunk_ready_handler
+            if handler is None:
+                raise RuntimeError("Request streaming has no registered output consumer")
+            output._record_device_ready()
+            output_id = uuid.uuid4().hex
+            output.async_output_id = output_id
+            with self._futures_lock:
+                self._finish_output(output_id, output, None)
+            try:
+                handler(request_id, output.chunk_index, output, None)
+            except BaseException:
+                self.drop_output(output_id)
+                raise
+
+        return emit
+
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
-        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
         self._ensure_open()
         runner_outputs: list[RunnerOutput] = []
@@ -158,8 +212,6 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         return BatchRunnerOutput.from_list(runner_outputs)
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
-
         self._ensure_open()
         if len(scheduler_output.scheduled_new_reqs) <= 1:
             return self.execute_request(scheduler_output)
@@ -175,8 +227,6 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         return result
 
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
-        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
-
         self._ensure_open()
         result = self.collective_rpc(
             "execute_stepwise",
@@ -246,6 +296,14 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
         worker = self.driver_worker
         self.driver_worker = None
         self._failure_callbacks.clear()
+        self._chunk_ready_handler = None
+        with self._futures_lock:
+            for future in self._output_futures.values():
+                if not future.done():
+                    future.set_exception(RuntimeError("Executor shut down"))
+            self._output_futures.clear()
+            self._completed_outputs.clear()
+            self._dropped_output_ids.clear()
         if worker is not None:
             try:
                 worker.shutdown()

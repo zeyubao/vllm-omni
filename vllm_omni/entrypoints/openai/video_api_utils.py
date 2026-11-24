@@ -60,6 +60,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     UrlVideoReference,
     VideoReference,
 )
+from vllm_omni.utils.scalars import positive_float as positive_float
 
 if TYPE_CHECKING:
     import av
@@ -157,20 +158,6 @@ def _validate_image_pixel_limit(image: Image.Image) -> None:
             f"the maximum of {max_pixels} pixels. Set "
             f"VLLM_MAX_IMAGE_PIXELS to increase this limit."
         )
-
-
-def positive_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if hasattr(value, "item") and not isinstance(value, (bytes, str)):
-        value = value.item()
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    if result <= 0:
-        return None
-    return result
 
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
